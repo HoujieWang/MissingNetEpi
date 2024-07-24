@@ -1,90 +1,76 @@
 rm(list = ls())
-library(parallel)
 library(Rcpp)
-library(Rfast)
-library(RcppZiggurat)
-library(RcppAlgos)
-library(tidyverse)
+library(matrixStats)
+library(VGAM)
 source("./sim_inference.R")
 source("./inference_util.R")
 source("./pre_process.R")
 source("./inference_miss_recov.R")
+library(parallel)
 
-priors = data.frame(count = rep(1,4), avg = c(0.075, 0.1, 0.005, 0.05))
-N_pop = 500; Tmax = 100; event.max = 1.5e4
-all_parm = expand.grid(self_prop = c(0.1, 0.5, 0.9),
-                       lag = c(1, 3),
-                       altru_d = c(1))
-all_dats = list()
-seeds = sample(1e8, 10)
+nsample = 4e3; nburn = 1e3; window_length = 12
+pr = data.frame(count = rep(1,4), avg = c(0.075, 0.1, 0.005, 0.05))
+beta = c(0.05, 0.075)
+net_params = rbind(c(.005, 0.001, .005, .05, 0.1, .05),
+                   c(.005, 0.001, .005, .05, 0.1, .05)*2)
+sim_params = cbind(rep(beta, nrow(net_params)), 0.1, matrix(rep(net_params, each = length(beta)), ncol = 6))
 
 idx = as.numeric(Sys.getenv('SLURM_ARRAY_TASK_ID'))
-for (i in 1: nrow(all_parm)) {
-  # i = 1
-  print(paste0("NOW GENERATING the", i, "-th DATA"))
-  parm = as.numeric(all_parm[i, ])
-  self_per = c(1: N_pop)[as.logical(rbinom(N_pop, 1, parm[1]))]
-  temp_dat = list()
-  for (j in 1: length(seeds)) {
-    set.seed(seeds[j])
-    dats = stochastic_coevolve_infer6(N=N_pop, 
-                                      tmax=100, event.max = event.max,
-                                      priors = data.frame(count = rep(1,4), avg = c(0.075, 0.1, 0.005, 0.05)),
-                                      bet=0.03, gam=0.1, 
-                                      init.infec = 1,
-                                      alpha.r=c(0.01, 0.001, 0.005, 0.01, 0.01, 0.01), 
-                                      alpha.d=c(0.05, parm[3], 0.075, 0.05, 0.05, 0.05),
-                                      init.net = NULL, selfish = c(1: N_pop)[as.logical(rbinom(N_pop, 1, parm[1]))], 
-                                      lag_period = parm[2],
-                                      init.p = 0.1)
-    temp_dat[[j]] = dats
-  }
-  all_dats[[i]] = temp_dat
-}
-saveRDS(all_dats, file = paste0("sim_data.rds"))
 
-for (lag in unique(all_parm$lag)) {
-  # lag = 1
-  idx = which(all_parm$lag == lag)
-  plot_dat = c()
-  line_id = 0
-  for (i in idx) {
-    # i = 1
-    plot_dat = rbind.data.frame(plot_dat,
-                                cbind.data.frame(do.call("rbind", lapply(1: length(all_dats[[i]]), 
-                                                                         function(ii){cbind(all_dats[[i]][[ii]]$events$time, all_dats[[i]][[ii]]$SIR_record, line_id+ii)})),
-                                                 prop = all_parm$self_prop[i])
-                                )
-    line_id = line_id + length(all_dats[[i]])
-  }
-  colnames(plot_dat) = c("time", "SI", "S", "I", "R", "id", "selfish%")
-  plot_dat$id = as.factor(plot_dat$id)
-  plot_dat$`selfish%` = as.factor(plot_dat$`selfish%`)
-  plot_dat_temp = plot_dat[plot_dat$id %in% c(5, 15, 25), ]
-  fig1 = ggplot(data = plot_dat_temp, aes(x = time, y = SI, group = id,color = `selfish%`)) + geom_line()
-  fig2 = ggplot(data = plot_dat_temp, aes(x = time, y = S, group = id,color = `selfish%`)) + geom_line()
-  fig3 = ggplot(data = plot_dat_temp, aes(x = time, y = I, group = id,color = `selfish%`)) + geom_line() + xlim(0, 11) + ylim(0, 450)
-  fig4 = ggplot(data = plot_dat_temp, aes(x = time, y = R, group = id,color = `selfish%`)) + geom_line()
+all_dats = readRDS("all_dats_2023-11-11.rds")
+
+all_res_coar_net = list()
+all_res_full_net = list()
+for (j in 1: nrow(sim_params)) {
+  # j = 4
+  print(paste0("Now running the ", j ,"-th param set"))
+  dats = all_dats[[idx]][[j]]
+
+  miss_dats1 = miss_recovery(dats, interval = 7, miss_prop = 1)
+  # obs_time = c(0, ceiling(max(miss_dats1$events$time)))
+  obs_time = c(0, unique(ceiling(miss_dats1$events$time/window_length)*window_length))
+  dats_no_recov_dis_net = net_coarsener3(miss_dats1, window_length)
   
+  
+  net_events = dats$events[dats$events$event %in% 3: 8, 1: 4]
+  survey_dat = net_coarsener4(net_events, dats$G0, obs_time, FALSE)
+  survey_dat$G0 = dats$G0
+  survey_dat$I0 = dats$I0
+  survey_dat$health_report = miss_dats1$report
+  survey_dat$sick_events = rbind.data.frame(c(0, 1, dats$I0, NA),
+                                            dats$events[dats$events$event == 1, 1: 4])
+  survey_dat$truth = dats$truth
+  
+  
+  res.fil3 = infer_miss_recov14_cpp(dat = survey_dat, force_one = TRUE, priors = pr, obs_time = obs_time, output.sams = 100, plot = F, verbose = F,
+                                    samples = nsample, burn = nburn, thin = 1, seed = 1)
+  
+  # res.fil = infer_miss_recov12_cpp(dat = survey_dat, priors = pr, obs_time = obs_time, output.sams = 100, plot = F, verbose = T,
+  #                                   samples = nsample, burn = nburn, thin = 1, seed = 1)
+  # 
+  res.fil2 = infer_miss_recov3(dat = dats_no_recov_dis_net, priors = pr, obs_time = obs_time, output.sams = 100, plot = F, verbose = T,
+                               samples = nsample, burn = nburn, thin = 1, impute = "filter", seed = 1)
+  res_array = array(NA, dim = c(dim(res.fil3[[1]]), 2))
+  res_array[, , 1] = res.fil2
+  res_array[, , 2] = res.fil3[[1]]
+  
+  temp_res = list()
+  temp_res[[1]] = res_array
+  names(temp_res) = paste0(window_length, "d")
+  
+  # Inference based on sampled recovery times and complete network observations
+  res.fil1 = infer_miss_recov(dats = miss_dats1, priors = pr, output.sams = 100, plot = F, verbose = F,
+                              samples = nsample, burn = nburn, thin = 1, impute = "filter", seed = 1)
+  
+  all_res_coar_net[[j]] = temp_res
+  all_res_full_net[[j]] = res.fil1
 }
 
-# table(all_dats[[3]]$events$event)
 
-# curve_type = c("SI", "S", "I", "R")
-# # for (i in 1: 4) {
-#   i = 3
-#   SI_tab = data.frame()
-#   for (ii in 4:6) {
-#     # ii = 1
-#     SI_tab = rbind.data.frame(SI_tab, 
-#                               cbind.data.frame(all_dats[[ii]]$events$time,
-#                                 all_dats[[ii]]$SIR_record[, i],
-#                                 paste0("(", all_parm[ii,1], "; ",  all_parm[ii,2]))
-#                               )
-#   }
-#   colnames(SI_tab) = c("time", "value", "type")
-#   ggplot(data = SI_tab,aes(x = time, y = value, color = type)) + 
-#     geom_line() + xlim(0, 25) + 
-#     ggtitle(paste0(curve_type[i], " vs. time"))
-# # }
 
+
+
+out_result = list(
+  full_net_res = all_res_full_net,
+  coar_net_res = all_res_coar_net)
+saveRDS(out_result, file = paste0("all_model_", as.numeric(Sys.getenv('SLURM_ARRAY_TASK_ID')), ".rds"))
